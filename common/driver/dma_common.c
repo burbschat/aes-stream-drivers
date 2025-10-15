@@ -223,7 +223,7 @@ int Dma_Init(struct DmaDevice *dev) {
    uint64_t tot;
 
    // Default debug disable
-   dev->debug = 0;
+   dev->debug = 1;
 
    // Allocate device numbers for character device. 1 minor numer starting at 0
    res = alloc_chrdev_region(&(dev->devNum), 0, 1, dev->devName);

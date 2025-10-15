@@ -57,6 +57,14 @@ int cfgMode0    = BUFF_COHERENT;
 int cfgMode1    = BUFF_COHERENT;
 int cfgMode2    = BUFF_ARM_ACP | AXIS2_RING_ACP;
 
+/* IRQ disable flag */
+int cfgIrqDis0 = 0;
+int cfgIrqDis1 = 0;
+int cfgIrqDis2 = 0;
+
+/* Debug level */
+int debug = 0;
+
 /**
  * Global DMA device array
  * An array of `DmaDevice` structures representing the DMA devices managed by this driver.
@@ -229,22 +237,28 @@ int Rce_Probe(struct platform_device *pdev) {
          dev->cfgRxCount = cfgRxCount0;
          dev->cfgSize = cfgSize0;
          dev->cfgMode = cfgMode0;
+         dev->cfgIrqDis = cfgIrqDis0;
          break;
       case 1:
          dev->cfgTxCount = cfgTxCount1;
          dev->cfgRxCount = cfgRxCount1;
          dev->cfgSize = cfgSize1;
          dev->cfgMode = cfgMode1;
+         dev->cfgIrqDis = cfgIrqDis1;
          break;
       case 2:
          dev->cfgTxCount = cfgTxCount2;
          dev->cfgRxCount = cfgRxCount2;
          dev->cfgSize = cfgSize2;
          dev->cfgMode = cfgMode2;
+         dev->cfgIrqDis = cfgIrqDis2;
          break;
       default:
          return -1;  // Invalid index
    }
+
+   dev->debug = debug;
+   pr_info("%s: Rrobe: Setting debug level to %d.\n", MOD_NAME, debug);
 
    // Instance-independent configuration
    dev->cfgCont = 1;
@@ -384,3 +398,15 @@ module_param(cfgMode1, int, 0);
 MODULE_PARM_DESC(cfgMode1, "RX buffer mode for channel 1.");
 module_param(cfgMode2, int, 0);
 MODULE_PARM_DESC(cfgMode2, "RX buffer mode for channel 2.");
+
+// IRQ disable flag.
+module_param(cfgIrqDis0, int, 0);
+MODULE_PARM_DESC(cfgIrqDis0, "IRQ disable flag for channel 0.");
+module_param(cfgIrqDis1, int, 0);
+MODULE_PARM_DESC(cfgIrqDis1, "IRQ disable flag for channel 1.");
+module_param(cfgIrqDis2, int, 0);
+MODULE_PARM_DESC(cfgIrqDis2, "IRQ disable flag for channel 2.");
+
+// Debug level
+module_param(debug, int, 0);
+MODULE_PARM_DESC(debug, "Debug message level");

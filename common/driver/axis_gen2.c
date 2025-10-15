@@ -75,6 +75,8 @@ inline uint8_t AxisG2_MapReturn(struct DmaDevice * dev, struct AxisG2Return *ret
    // Calculate pointer to the descriptor based on index and descriptor size
    ptr = (ring + (index*(desc128En?4UL:2UL)));
 
+   if ( dev->debug > 0 ) dev_info(dev->device, "desc128En=%i, index=%i, ring=0x%llx, ptr=0x%llx\n", desc128En, index, (uint64_t)ring, (uint64_t)ptr);
+
    // Timeout flag defaulted to 0, only set for 128-bit descriptors, w/ver >= 5
    ret->timeout = 0;
 
@@ -275,6 +277,7 @@ uint32_t AxisG2_Process(struct DmaDevice * dev, struct AxisG2Reg *reg, struct Ax
    spin_lock(&dev->maskLock);
 
    // Check write (receive) descriptors
+   if ( dev->debug > 0 ) dev_info(dev->device, "desc128En=%i, writeIndex=%i, writeAddr=0x%llx\n", hwData->desc128En, hwData->writeIndex, (uint64_t)hwData->writeAddr);
    while ( AxisG2_MapReturn(dev, &ret, hwData->desc128En, hwData->writeIndex, hwData->writeAddr) ) {
       ++handleCount;
       --(hwData->hwWrBuffCnt);
@@ -811,12 +814,12 @@ void AxisG2_SeqShow(struct seq_file *s, struct DmaDevice *dev) {
    seq_printf(s, "\n");
    seq_printf(s, "---------- DMA Firmware General ----------\n");
    seq_printf(s, "          Int Req Count : %u\n", (readl(&(reg->intReqCount))));
-// seq_printf(s, "        Hw Dma Wr Index : %u\n", (readl(&(reg->hwWrIndex))));
-// seq_printf(s, "        Sw Dma Wr Index : %u\n", hwData->writeIndex);
-// seq_printf(s, "        Hw Dma Rd Index : %u\n", (readl(&(reg->hwRdIndex))));
-// seq_printf(s, "        Sw Dma Rd Index : %u\n", hwData->readIndex);
-// seq_printf(s, "     Missed Wr Requests : %u\n", (readl(&(reg->wrReqMissed))));
-// seq_printf(s, "       Missed IRQ Count : %u\n", hwData->missedIrq);
+   seq_printf(s, "        Hw Dma Wr Index : %u\n", (readl(&(reg->hwWrIndex))));
+   seq_printf(s, "        Sw Dma Wr Index : %u\n", hwData->writeIndex);
+   seq_printf(s, "        Hw Dma Rd Index : %u\n", (readl(&(reg->hwRdIndex))));
+   seq_printf(s, "        Sw Dma Rd Index : %u\n", hwData->readIndex);
+   seq_printf(s, "     Missed Wr Requests : %u\n", (readl(&(reg->wrReqMissed))));
+   seq_printf(s, "       Missed IRQ Count : %u\n", hwData->missedIrq);
    seq_printf(s, "         Continue Count : %u\n", hwData->contCount);
    seq_printf(s, "          Address Count : %i\n", hwData->addrCount);
    seq_printf(s, "    Hw Write Buff Count : %i\n", hwData->hwWrBuffCnt);

@@ -21,6 +21,7 @@ struct hardware_functions RceHp_functions = {
    .irq          = NULL,
    .init         = RceHp_Init,
    .enable       = RceHp_Enable,
+   .irqEnable    = RceHp_IrqEnable,
    .clear        = RceHp_Clear,
    .retRxBuffer  = RceHp_RetRxBuffer,
    .sendBuffer   = RceHp_SendBuffer,
@@ -29,7 +30,7 @@ struct hardware_functions RceHp_functions = {
 };
 
 // Init card in top level Probe
-void RceHp_Init(struct DmaDevice *dev) {
+int RceHp_Init(struct DmaDevice *dev) {
    uint32_t x;
 
    struct DmaBuffer * buff;
@@ -57,6 +58,7 @@ void RceHp_Init(struct DmaDevice *dev) {
    // Set dest mask
    memset(dev->destMask, 0x0, DMA_MASK_SIZE);
    dev_info(dev->device, "Init: Done.\n");
+   return 0;
 }
 
 // Enable the card
@@ -80,6 +82,8 @@ void RceHp_Clear(struct DmaDevice *dev) {
    iowrite32(0x0, &(reg->enable));
 }
 
+// Enable/disable IRQs in hardware
+void RceHp_IrqEnable(struct DmaDevice *dev, int en) { }
 
 // Return receive buffer to card
 // Single write so we don't need to lock

@@ -7,6 +7,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Change directory to where this script is
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+
 # Determine the Linux distribution
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -27,7 +30,16 @@ else
     echo "Error: Unsupported Linux distribution." >&2
     exit 1
 fi
+
+# Dumb fallback...
+if [ -z "${CC}" ]; then
+    CC="gcc"
+    echo "WARNING: Unable to determine GCC version. Using $CC"
+fi
+
 echo "CC: $CC"
+
+
 
 # Define Nvidia path
 output=$(find /usr -name nv-p2p.h 2>/dev/null)
@@ -45,7 +57,7 @@ RET_DIR=$PWD
 echo "Using RET_DIR: $RET_DIR"
 
 # Remove existing Nvidia modules (if any)
-modules=("datadev" "nvidia-drm" "nvidia-uvm" "nvidia-modeset" "nvidia" "nouveau")
+modules=("datadev" "nvidia_fs" "nvidia-drm" "nvidia-uvm" "nvidia-modeset" "nvidia" "nouveau")
 for module in "${modules[@]}"; do
     output=$(/usr/sbin/rmmod $module 2>&1)
     status=$?

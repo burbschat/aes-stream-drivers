@@ -27,8 +27,19 @@
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
+#include <linux/version.h>
 #include <DmaDriver.h>
 #include <dma_buffer.h>
+
+#ifndef RHEL_RELEASE_VERSION
+#define RHEL_RELEASE_VERSION(...) 0
+#endif
+
+#ifdef __GNUC__
+#define MAYBE_UNUSED __attribute__((unused))
+#else
+#define MAYBE_UNUSED
+#endif
 
 // Maximum number of destination channels
 #define DMA_MAX_DEST (8*DMA_MASK_SIZE)
@@ -36,6 +47,11 @@
 // Forward declarations
 struct hardware_functions;
 struct DmaDesc;
+
+// __poll_t was only added in v4.16. Provide our own typedef for older kernels.
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
+typedef uint32_t __poll_t;
+#endif
 
 /**
  * struct DmaDevice - Represents a DMA-capable device.
@@ -84,13 +100,13 @@ struct DmaDevice {
    uint32_t    baseSize;
 
    // Base pointer to memory region
-   uint8_t * base;
+   __iomem uint8_t * base;
 
    // Register pointers, may be the same as reg
-   void * reg;  // hardware specific
+   __iomem void * reg;  // hardware specific
 
    // Direct read/write offset and size
-   uint8_t * rwBase;
+   __iomem uint8_t * rwBase;
    uint32_t  rwSize;
 
    // Configuration
@@ -168,6 +184,23 @@ struct DmaDesc {
 
    // Pointer back to card structure
    struct DmaDevice * dev;
+
+   // Scratch data buffers for ioctl and read operations
+   uint32_t* indexScratch;
+   struct DmaReadData* readDataScratch;
+   struct DmaBuffer** buffListScratch;
+
+   // Number of elements in the read scratch buffer. Corresponds to cfgRxCount
+   uint32_t readScratchCount;
+
+   // Number of elements in the index scratch buffer.
+   uint32_t indexScratchCount;
+
+   // Number of elements in the buff list scratch buffer.
+   uint32_t buffListScratchCount;
+
+   // Operation guard
+   struct mutex mutex;
 };
 
 /**
@@ -175,6 +208,7 @@ struct DmaDesc {
  * @irq: IRQ handler function.
  * @init: Initialization function.
  * @enable: Enable operation function.
+ * @irqEnable: Enable or disable interrupts on the device
  * @clear: Clear operation function.
  * @retRxBuffer: Return received buffer function.
  * @sendBuffer: Send buffer function.
@@ -187,9 +221,10 @@ struct DmaDesc {
  */
 struct hardware_functions {
    irqreturn_t (*irq)(int irq, void *dev_id);
-   void        (*init)(struct DmaDevice *dev);
+   int         (*init)(struct DmaDevice *dev);
    void        (*enable)(struct DmaDevice *dev);
    void        (*clear)(struct DmaDevice *dev);
+   void        (*irqEnable)(struct DmaDevice *dev, int mask);
    void        (*retRxBuffer)(struct DmaDevice *dev, struct DmaBuffer **buff, uint32_t count);
    int32_t     (*sendBuffer)(struct DmaDevice *dev, struct DmaBuffer **buff, uint32_t count);
    int32_t     (*command)(struct DmaDevice *dev, uint32_t cmd, uint64_t arg);
@@ -209,16 +244,20 @@ extern struct class * gCl;
 extern struct file_operations DmaFunctions;
 
 // Function prototypes
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0) || (defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 4))
+char *Dma_DevNode(const struct device *dev, umode_t *mode);
+#else
 char *Dma_DevNode(struct device *dev, umode_t *mode);
+#endif
 int Dma_MapReg(struct DmaDevice *dev);
 int Dma_Init(struct DmaDevice *dev);
 void Dma_Clean(struct DmaDevice *dev);
 int Dma_Open(struct inode *inode, struct file *filp);
 int Dma_Release(struct inode *inode, struct file *filp);
-ssize_t Dma_Read(struct file *filp, char *buffer, size_t count, loff_t *f_pos);
-ssize_t Dma_Write(struct file *filp, const char* buffer, size_t count, loff_t* f_pos);
+ssize_t Dma_Read(struct file *filp, __user char *buffer, size_t count, loff_t *f_pos);
+ssize_t Dma_Write(struct file *filp, __user const char *buffer, size_t count, loff_t* f_pos);
 ssize_t Dma_Ioctl(struct file *filp, uint32_t cmd, unsigned long arg);
-uint32_t Dma_Poll(struct file *filp, poll_table *wait);
+__poll_t Dma_Poll(struct file *filp, poll_table *wait);
 int Dma_Mmap(struct file *filp, struct vm_area_struct *vma);
 int Dma_Fasync(int fd, struct file *filp, int mode);
 int Dma_ProcOpen(struct inode *inode, struct file *file);

@@ -5,6 +5,7 @@
 *.cmd
 *.mod.c
 *.mod
+.nfs*
 
 **/.tmp_versions/*
 **/Module.symvers
@@ -15,3 +16,21 @@
 
 compile_commands.json
 .cache/
+
+.vscode/
+.cursor/
+.claude/
+.planning/
+CLAUDE.md
+
+docs/_build/
+docs/_doxygen/
+_doxygen/
+
+.dkms-*
+*.tar.gz
+
+.diag/
+logs/
+emulator/driver/.build_version
+emulator/gpu_stub/.build_version

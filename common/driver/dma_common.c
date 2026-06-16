@@ -29,8 +29,10 @@
 #include <linux/version.h>
 #include <linux/slab.h>
 
-#ifndef RHEL_RELEASE_VERSION
-#define RHEL_RELEASE_VERSION(...) 0
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+#include <linux/minmax.h>
+#else
+#include <linux/kernel.h>
 #endif
 
 /**
@@ -146,7 +148,11 @@ struct class *gCl;
  *
  * Returns NULL always.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0) || (defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 4))
+char *Dma_DevNode(const struct device *dev, umode_t *mode) {
+#else
 char *Dma_DevNode(struct device *dev, umode_t *mode) {
+#endif
    if (mode != NULL) {
       *mode = 0666;
    }
@@ -162,11 +168,15 @@ char *Dma_DevNode(struct device *dev, umode_t *mode) {
  * resources are properly cleaned up.
  */
 void Dma_UnmapReg(struct DmaDevice *dev) {
+   // Idempotent: callable from multiple cleanup paths.
+   if (dev->base == NULL) return;
+
    // Release the allocated memory region
    release_mem_region(dev->baseAddr, dev->baseSize);
 
    // Unmap the device I/O memory
    iounmap(dev->base);
+   dev->base = NULL;
 }
 
 /**
@@ -185,7 +195,7 @@ int Dma_MapReg(struct DmaDevice *dev) {
    if (dev->base == NULL) {
       dev_info(dev->device, "Init: Mapping Register space 0x%llx with size 0x%x.\n", (uint64_t)dev->baseAddr, dev->baseSize);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
       dev->base = ioremap(dev->baseAddr, dev->baseSize);
 #else
       dev->base = ioremap_nocache(dev->baseAddr, dev->baseSize);
@@ -196,12 +206,13 @@ int Dma_MapReg(struct DmaDevice *dev) {
          return -1;
       }
       dev->reg = dev->base;
-      dev_info(dev->device, "Init: Mapped to 0x%llx.\n", (uint64_t)dev->base);
+      dev_info(dev->device, "Init: Mapped to 0x%p.\n", dev->base);
 
       // Hold memory region
       if (request_mem_region(dev->baseAddr, dev->baseSize, dev->devName) == NULL) {
          dev_err(dev->device, "Init: Memory in use.\n");
          iounmap(dev->base);
+         dev->base = NULL;
          return -1;
       }
    }
@@ -222,8 +233,10 @@ int Dma_Init(struct DmaDevice *dev) {
    ssize_t res;
    uint64_t tot;
 
-   // Default debug disable
-   dev->debug = 1;
+   // Note the debug flag set
+   if (dev->debug) {
+      dev_info(dev->device, "Init: Debug logging enabled\n");
+   }
 
    // Allocate device numbers for character device. 1 minor numer starting at 0
    res = alloc_chrdev_region(&(dev->devNum), 0, 1, dev->devName);
@@ -237,7 +250,7 @@ int Dma_Init(struct DmaDevice *dev) {
    dev->major = MAJOR(dev->devNum);
 
    // Add the character device
-   if (cdev_add(&(dev->charDev), dev->devNum, 1) == -1) {
+   if (cdev_add(&(dev->charDev), dev->devNum, 1) < 0) {
       dev_err(dev->device, "Init: Failed to add device file.\n");
       goto cleanup_alloc_chrdev_region;
    }
@@ -253,16 +266,19 @@ int Dma_Init(struct DmaDevice *dev) {
       gCl = class_create(THIS_MODULE, dev->devName);
 #endif
 
-      if (gCl == NULL) {
+      // class_create returns ERR_PTR on failure; reset to NULL so
+      // shared cleanup (gDmaDevCount == 0 && gCl != NULL) is safe.
+      if (IS_ERR_OR_NULL(gCl)) {
          dev_err(dev->device, "Init: Failed to create device class\n");
+         gCl = NULL;
          goto cleanup_cdev_add;
       }
 
-      gCl->devnode = (void *)Dma_DevNode;
+      gCl->devnode = Dma_DevNode;
    }
 
    // Attempt to create the device
-   if (device_create(gCl, NULL, dev->devNum, NULL, "%s", dev->devName) == NULL) {
+   if (IS_ERR_OR_NULL(device_create(gCl, NULL, dev->devNum, NULL, "%s", dev->devName))) {
       dev_err(dev->device, "Init: Failed to create device file\n");
       goto cleanup_class_create;
    }
@@ -323,8 +339,15 @@ int Dma_Init(struct DmaDevice *dev) {
    if ( dev->cfgRxCount > 0 && res == 0 )
       goto cleanup_dma_queue;
 
-   // Call card specific init
-   dev->hwFunc->init(dev);
+   // Call card specific init. On failure the init function
+   // owns its own cleanup; we must not call ->clear() because
+   // dev->hwData may be NULL or partially built. Log the
+   // returned errno so the real failure reason survives.
+   res = dev->hwFunc->init(dev);
+   if (res < 0) {
+      dev_err(dev->device, "Init: Card-specific init failed: %zd.\n", res);
+      goto cleanup_rx_buffers;
+   }
 
    // Set interrupt
    if ( dev->irq != 0 ) {
@@ -344,13 +367,11 @@ int Dma_Init(struct DmaDevice *dev) {
 
    /* Clean mess on failure */
 
-// Free requested IRQ
-   if ( dev->irq != 0 ) free_irq(dev->irq, dev);
-
 cleanup_card_clear:
    dev->hwFunc->clear(dev);
 
-// Clean RX buffers
+cleanup_rx_buffers:
+   // Clean RX buffers
    dmaFreeBuffers(&(dev->rxBuffers));
 
 cleanup_dma_queue:
@@ -397,13 +418,18 @@ cleanup_alloc_chrdev_region:
 void Dma_Clean(struct DmaDevice *dev) {
    uint32_t x;
 
-   // Call card-specific clear function.
-   dev->hwFunc->clear(dev);
+   // Disable interrupts on the card itself
+   if (dev->hwFunc)
+      dev->hwFunc->irqEnable(dev, 0);
 
    // Release IRQ if allocated.
    if (dev->irq != 0) {
       free_irq(dev->irq, dev);
    }
+
+   // Call card-specific clear function.
+   if (dev->hwFunc)
+      dev->hwFunc->clear(dev);
 
    // Free RX and TX buffers.
    dmaFreeBuffers(&(dev->rxBuffers));
@@ -472,7 +498,28 @@ int Dma_Open(struct inode *inode, struct file *filp) {
       return -ENOMEM;  // Return an error if allocation fails
    }
 
-   memset(desc, 0, sizeof(struct DmaDesc));
+   // Allocate scratch data buffers
+   desc->readScratchCount = dev->cfgRxCount + dev->cfgTxCount;
+   desc->readDataScratch = (struct DmaReadData*)kzalloc(sizeof(struct DmaReadData) * desc->readScratchCount, GFP_KERNEL);
+
+   desc->indexScratchCount = dev->cfgRxCount + dev->cfgTxCount;
+   desc->indexScratch = (uint32_t*)kzalloc(sizeof(uint32_t) * desc->indexScratchCount, GFP_KERNEL);
+
+   desc->buffListScratchCount = dev->cfgRxCount + dev->cfgTxCount;
+   desc->buffListScratch = (struct DmaBuffer**)kzalloc(sizeof(struct DmaBuffer*) * desc->buffListScratchCount, GFP_KERNEL);
+
+   if (!desc->readDataScratch || !desc->indexScratch || !desc->buffListScratch) {
+      dev_err(dev->device, "Open: kzalloc for scratch area(s) failed\n");
+      kfree(desc->readDataScratch);
+      kfree(desc->indexScratch);
+      kfree(desc->buffListScratch);
+      kfree(desc);
+      return -ENOMEM;
+   }
+
+   // Init the mutex
+   mutex_init(&desc->mutex);
+
    dmaQueueInit(&(desc->q), dev->cfgRxCount);
    desc->async_queue = NULL;
    desc->dev = dev;
@@ -572,6 +619,11 @@ int Dma_Release(struct inode *inode, struct file *filp) {
 
    // Clear the tx queue and free the descriptor
    dmaQueueFree(&(desc->q));
+
+   // Free scratch buffers
+   kfree(desc->buffListScratch);
+   kfree(desc->indexScratch);
+   kfree(desc->readDataScratch);
    kfree(desc);
    return 0;
 }
@@ -589,19 +641,15 @@ int Dma_Release(struct inode *inode, struct file *filp) {
  *
  * Return: The number of read structures on success or an error code on failure.
  */
-ssize_t Dma_Read(struct file *filp, char *buffer, size_t count, loff_t *f_pos) {
-   struct DmaBuffer **buff;
-   struct DmaReadData *rd;
-   void *dp;
-   uint64_t ret;
-   size_t rCnt;
-   ssize_t bCnt;
-   ssize_t x;
-   struct DmaDesc *desc;
-   struct DmaDevice *dev;
-
-   desc = (struct DmaDesc *)filp->private_data;
-   dev = desc->dev;
+ssize_t Dma_Read(struct file *filp, __user char *buffer, size_t count, loff_t *f_pos) {
+   size_t rCnt = 0;
+   ssize_t bCnt = 0;
+   size_t copied = 0;
+   ssize_t x = 0;
+   __user void *dp = NULL;
+   struct DmaDesc *desc = (struct DmaDesc *)filp->private_data;
+   struct DmaDevice *dev = desc->dev;
+   struct DmaReadData *rd = NULL;
 
    // Verify the size of the passed structure
    if ((count % sizeof(struct DmaReadData)) != 0) {
@@ -610,58 +658,84 @@ ssize_t Dma_Read(struct file *filp, char *buffer, size_t count, loff_t *f_pos) {
       return -1;
    }
 
+   // Number of buffers to read, in total
    rCnt = count / sizeof(struct DmaReadData);
-   rd = (struct DmaReadData *)kzalloc(rCnt * sizeof(struct DmaReadData), GFP_KERNEL);
-   buff = (struct DmaBuffer **)kzalloc(rCnt * sizeof(struct DmaBuffer *), GFP_KERNEL);
+
+   // Check that we can read that many buffers
+   if (rCnt > desc->readScratchCount || rCnt > desc->buffListScratchCount) {
+      dev_warn(dev->device, "Read: attempted to read too many buffers. rCnt=%zu > max=%d\n",
+         rCnt, min(desc->readScratchCount, desc->buffListScratchCount));
+      return -EINVAL;
+   }
+
+   mutex_lock(&desc->mutex);
+
+   // Check that we can actually access the user buffers
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+   if (!access_ok(buffer, rCnt * sizeof(struct DmaReadData), VERIFY_WRITE)) {
+#else
+   if (!access_ok(buffer, rCnt * sizeof(struct DmaReadData))) {
+#endif
+      dev_warn(dev->device, "Read: Unable to access user buffer. buffer=%p, size=%ld\n",
+         buffer, rCnt * sizeof(struct DmaReadData));
+      mutex_unlock(&desc->mutex);
+      return -EFAULT;
+   }
+
+   rd = desc->readDataScratch;
 
    // Copy the read structure from user space
-   if ((ret = copy_from_user(rd, buffer, rCnt * sizeof(struct DmaReadData)))) {
-      dev_warn(dev->device, "Read: failed to copy struct from user space ret=%llu, user=%p kern=%p\n",
-               ret, (void *)buffer, (void *)rd);
+   if ((copied = copy_from_user(rd, buffer, rCnt * sizeof(struct DmaReadData)))) {
+      dev_warn(dev->device, "Read: failed to copy struct from user space ret=%zu, user=%p kern=%p\n",
+               copied, buffer, rd);
+      mutex_unlock(&desc->mutex);
       return -1;
    }
 
    // Get buffers from the DMA queue
-   bCnt = dmaQueuePopList(&(desc->q), buff, rCnt);
+   bCnt = dmaQueuePopList(&(desc->q), desc->buffListScratch, rCnt);
 
    for (x = 0; x < bCnt; x++) {
+      // Grab the latest buffer
+      struct DmaBuffer* buff = desc->buffListScratch[x];
+
       // Report frame error
-      if (buff[x]->error)
-         dev_warn(dev->device, "Read: error encountered 0x%x.\n", buff[x]->error);
+      if (buff->error)
+         dev_warn(dev->device, "Read: error encountered 0x%x.\n", buff->error);
 
       // Copy associated data to the read structure
-      rd[x].dest = buff[x]->dest;
-      rd[x].flags = buff[x]->flags;
-      rd[x].index = buff[x]->index;
-      rd[x].error = buff[x]->error;
-      rd[x].ret = (int32_t)buff[x]->size;
+      rd[x].dest = buff->dest;
+      rd[x].flags = buff->flags;
+      rd[x].index = buff->index;
+      rd[x].error = buff->error;
+      rd[x].ret = (int32_t)buff->size;
 
       // Convert pointer based on architecture
       if (sizeof(void *) == 4 || rd[x].is32)
-         dp = (void *)(rd[x].data & 0xFFFFFFFF);
+         dp = (__user void *)(rd[x].data & 0xFFFFFFFF);
       else
-         dp = (void *)rd[x].data;
+         dp = (__user void *)rd[x].data;
 
       // Use index if pointer is zero
-      if (dp == 0) {
-          buff[x]->userHas = desc;
+      if (dp == NULL) {
+         buff->userHas = desc;
       } else {
          // Warn if user buffer is too small
-         if (rd[x].size < buff[x]->size) {
+         if (rd[x].size < buff->size) {
             dev_warn(dev->device, "Read: user buffer is too small. Rx=%i, User=%i.\n",
-                     buff[x]->size, (int32_t)rd[x].size);
+                     buff->size, (int32_t)rd[x].size);
             rd[x].error |= DMA_ERR_MAX;
             rd[x].ret = -1;
 
          // Copy data to user space
-         } else if ((ret = copy_to_user(dp, buff[x]->buffAddr, buff[x]->size))) {
-            dev_warn(dev->device, "Read: failed to copy data to user space ret=%llu, user=%p kern=%p size=%u.\n",
-                     ret, dp, buff[x]->buffAddr, buff[x]->size);
+         } else if ((copied = copy_to_user(dp, buff->buffAddr, buff->size))) {
+            dev_warn(dev->device, "Read: failed to copy data to user space ret=%zu, user=%p kern=%p size=%u.\n",
+                     copied, dp, buff->buffAddr, buff->size);
             rd[x].ret = -1;
          }
 
          // Return entry to RX queue
-         dev->hwFunc->retRxBuffer(dev, &(buff[x]), 1);
+         dev->hwFunc->retRxBuffer(dev, &buff, 1);
       }
 
       // Debug information
@@ -670,15 +744,15 @@ ssize_t Dma_Read(struct file *filp, char *buffer, size_t count, loff_t *f_pos) {
                   rd[x].ret, rd[x].dest, rd[x].flags, rd[x].error);
       }
    }
-   kfree(buff);
 
    // Copy the read structure back to user space
-   if ((ret = copy_to_user(buffer, rd, rCnt * sizeof(struct DmaReadData)))) {
-      dev_warn(dev->device, "Read: failed to copy struct to user space ret=%llu, user=%p kern=%p\n",
-               ret, (void *)buffer, (void *)&rd);
+   if ((copied = copy_to_user(buffer, rd, rCnt * sizeof(struct DmaReadData)))) {
+      dev_warn(dev->device, "Read: failed to copy struct to user space ret=%zu, user=%p kern=%p\n",
+               copied, buffer, &rd);
    }
-   kfree(rd);
-   return bCnt;
+
+   mutex_unlock(&desc->mutex);
+   return x;
 }
 
 /**
@@ -695,10 +769,10 @@ ssize_t Dma_Read(struct file *filp, char *buffer, size_t count, loff_t *f_pos) {
  *
  * Return: Number of bytes written on success, negative error code on failure.
  */
-ssize_t Dma_Write(struct file *filp, const char *buffer, size_t count, loff_t *f_pos) {
+ssize_t Dma_Write(struct file *filp, __user const char *buffer, size_t count, loff_t *f_pos) {
    uint64_t ret;
    ssize_t res;
-   void *dp;
+   __user void *dp;
    struct DmaWriteData wr;
    struct DmaBuffer *buff;
    struct DmaDesc *desc;
@@ -719,7 +793,7 @@ ssize_t Dma_Write(struct file *filp, const char *buffer, size_t count, loff_t *f
    // Copy data structure from user space
    if ((ret = copy_from_user(&wr, buffer, sizeof(struct DmaWriteData)))) {
       dev_warn(dev->device, "Write: failed to copy struct from user space ret=%llu, user=%p kern=%p.\n",
-               ret, (void *)buffer, (void *)&wr);
+               ret, buffer, &wr);
       return -1;
    }
 
@@ -740,13 +814,13 @@ ssize_t Dma_Write(struct file *filp, const char *buffer, size_t count, loff_t *f
 
    // Convert pointer based on architecture or request
    if (sizeof(void *) == 4 || wr.is32) {
-       dp = (void *)(wr.data & 0xFFFFFFFF);
+      dp = (__user void *)(wr.data & 0xFFFFFFFF);
    } else {
-       dp = (void *)wr.data;
+      dp = (__user void *)wr.data;
    }
 
    // Use index if pointer is null
-   if (dp == 0) {
+   if (dp == NULL) {
       if ((buff = dmaGetBuffer(dev, wr.index)) == NULL) {
          dev_warn(dev->device, "Write: Invalid index posted: %i.\n", wr.index);
          return -1;
@@ -786,6 +860,94 @@ ssize_t Dma_Write(struct file *filp, const char *buffer, size_t count, loff_t *f
 }
 
 /**
+ * Dma_Ret_Indexes - Return indexes to the hardware
+ * @filp: File pointer
+ * @cmd: IOCTL command to execute
+ * @arg: user destination buffer
+ */
+static ssize_t Dma_Ret_Indexes(struct file *filp, uint32_t cmd, __user void* arg) {
+   struct DmaDesc   * desc;
+   struct DmaDevice * dev;
+   struct DmaBuffer * buff;
+   uint32_t cnt = (cmd >> 16) & 0xFFFF;
+   uint32_t x = 0;
+   uint32_t bCnt = 0;
+
+   desc = (struct DmaDesc *)filp->private_data;
+   dev  = desc->dev;
+
+   // No work to do
+   if (cnt == 0)
+      return 0;
+
+   // Reject returns that are too large for the scratch buffer
+   if (cnt > desc->indexScratchCount) {
+      dev_warn(dev->device, "Ret_Indexes: Tried to return too many indexes (%d > %d)\n",
+         cnt, (int)desc->indexScratchCount);
+      return -EINVAL;
+   }
+
+   // Ensure the buffer is readable
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+   if (!access_ok(arg, cnt * sizeof(uint32_t), VERIFY_READ)) {
+#else
+   if (!access_ok(arg, cnt * sizeof(uint32_t))) {
+#endif
+      dev_warn(dev->device, "Ret_Indexes: Invalid user buffer provided. buffer=%p, size=%ld\n",
+         arg, cnt * sizeof(uint32_t));
+      return -EFAULT;
+   }
+
+   mutex_lock(&desc->mutex);
+
+   // This should really never happen because we already checked with access_ok
+   if (copy_from_user(desc->indexScratch, arg, (cnt * sizeof(uint32_t)))) {
+      dev_warn(dev->device, "Ret_Indexes: copy_from_user failed. buf=%p, bytes=%ld\n",
+         arg, cnt * sizeof(uint32_t));
+      mutex_unlock(&desc->mutex);
+      return -1;
+   }
+
+   bCnt = 0;
+   for (x = 0; x < cnt; x++) {
+      // Attempt to find buffer in RX list
+      if ( (buff = dmaGetBufferList(&(dev->rxBuffers), desc->indexScratch[x])) != NULL ) {
+         // Only return if owned by current desc
+         if ( buff->userHas == desc ) {
+            buff->userHas = NULL;
+            desc->buffListScratch[bCnt++] = buff;
+         }
+      // Attempt to find in tx list
+      } else if ( (buff = dmaGetBufferList(&(dev->txBuffers), desc->indexScratch[x])) != NULL ) {
+         // Only return if owned by current desc
+         if ( buff->userHas == desc ) {
+            buff->userHas = NULL;
+
+            // Return entry to TX queue
+            dmaQueuePush(&(dev->tq), buff);
+         }
+      } else {
+         dev_warn(dev->device, "Command: Invalid index posted: %i.\n", desc->indexScratch[x]);
+         // Clear these out for subsequent operations, just in case.
+         memset(desc->buffListScratch, 0, sizeof(struct DmaBuffer*) * desc->buffListScratchCount);
+         memset(desc->indexScratch, 0, sizeof(uint32_t) * desc->indexScratchCount);
+         mutex_unlock(&desc->mutex);
+         return -EINVAL;
+      }
+   }
+
+   // Return receive buffers
+   dev->hwFunc->retRxBuffer(dev, desc->buffListScratch, bCnt);
+
+   // Clear these for subsequent operations, just in case.
+   memset(desc->buffListScratch, 0, sizeof(struct DmaBuffer*) * desc->buffListScratchCount);
+   memset(desc->indexScratch, 0, sizeof(uint32_t) * desc->indexScratchCount);
+
+   mutex_unlock(&desc->mutex);
+   return 0;
+}
+
+/**
  * Dma_Ioctl - Perform commands on DMA device
  * @filp: pointer to the file structure
  * @cmd: command to execute
@@ -804,17 +966,13 @@ ssize_t Dma_Ioctl(struct file *filp, uint32_t cmd, unsigned long arg) {
    struct DmaDesc   * desc;
    struct DmaDevice * dev;
    struct DmaBuffer * buff;
-   struct DmaBuffer ** buffList;
 
    uint32_t   x;
-   uint32_t   cnt;
-   uint32_t   bCnt;
    uint32_t   userCnt;
    uint32_t   hwCnt;
    uint32_t   hwQCnt;
    uint32_t   qCnt;
    uint32_t   miss;
-   uint32_t * indexes;
 
    desc = (struct DmaDesc *)filp->private_data;
    dev  = desc->dev;
@@ -966,52 +1124,13 @@ ssize_t Dma_Ioctl(struct file *filp, uint32_t cmd, unsigned long arg) {
 
       // Attempt to reserve destination
       case DMA_Set_MaskBytes:
-         if ( copy_from_user(newMask, (void *)arg, DMA_MASK_SIZE) ) return -1;
+         if ( copy_from_user(newMask, (__user void *)arg, DMA_MASK_SIZE) ) return -1;
          return Dma_SetMaskBytes(dev, desc, newMask);
          break;
 
       // Return buffer index
       case DMA_Ret_Index:
-         cnt = (cmd >> 16) & 0xFFFF;
-
-         if ( cnt == 0 ) return 0;
-         indexes = kzalloc(cnt * sizeof(uint32_t), GFP_KERNEL);
-         if (copy_from_user(indexes, (void *)arg, (cnt * sizeof(uint32_t)))) return -1;
-
-         buffList = (struct DmaBuffer **)kzalloc(cnt * sizeof(struct DmaBuffer *), GFP_KERNEL);
-         bCnt = 0;
-
-         for (x=0; x < cnt; x++) {
-            // Attempt to find buffer in RX list
-            if ( (buff = dmaGetBufferList(&(dev->rxBuffers), indexes[x])) != NULL ) {
-               // Only return if owned by current desc
-               if ( buff->userHas == desc ) {
-                  buff->userHas = NULL;
-                  buffList[bCnt++] = buff;
-               }
-
-            // Attempt to find in tx list
-            } else if ( (buff = dmaGetBufferList(&(dev->txBuffers), indexes[x])) != NULL ) {
-               // Only return if owned by current desc
-               if ( buff->userHas == desc ) {
-                  buff->userHas = NULL;
-
-                  // Return entry to TX queue
-                  dmaQueuePush(&(dev->tq), buff);
-               }
-            } else {
-               dev_warn(dev->device, "Command: Invalid index posted: %i.\n", indexes[x]);
-               kfree(indexes);
-               return -1;
-            }
-         }
-
-         // Return receive buffers
-         dev->hwFunc->retRxBuffer(dev, buffList, bCnt);
-
-         kfree(buffList);
-         kfree(indexes);
-         return 0;
+         return Dma_Ret_Indexes(filp, cmd, (__user void*)arg);
          break;
 
       // Request a write buffer index
@@ -1034,7 +1153,7 @@ ssize_t Dma_Ioctl(struct file *filp, uint32_t cmd, unsigned long arg) {
 
       // Get GIT Version
       case DMA_Get_GITV:
-         if (copy_to_user((char *)arg, GITV, strnlen(GITV, 32))) {
+         if (copy_to_user((__user char *)arg, GITV, strnlen(GITV, 32))) {
             return -EFAULT;
          }
          return 0;
@@ -1078,11 +1197,11 @@ ssize_t Dma_Ioctl(struct file *filp, uint32_t cmd, unsigned long arg) {
  * queue is not empty, and writability (POLLOUT | POLLWRNORM) if the
  * device's transmit queue is not empty.
  */
-uint32_t Dma_Poll(struct file *filp, poll_table *wait) {
+__poll_t Dma_Poll(struct file *filp, poll_table *wait) {
    struct DmaDesc *desc;
    struct DmaDevice *dev;
 
-   __u32 mask = 0;
+   u32 mask = 0;
 
    desc = (struct DmaDesc *)filp->private_data;
    dev = desc->dev;
@@ -1099,7 +1218,7 @@ uint32_t Dma_Poll(struct file *filp, poll_table *wait) {
    if (dmaQueueNotEmpty(&(dev->tq)))
       mask |= POLLOUT | POLLWRNORM;
 
-   return mask;
+   return (__force __poll_t)mask;
 }
 
 /**
@@ -1382,7 +1501,7 @@ int Dma_SeqShow(struct seq_file *s, void *v) {
 // seq_printf(s, "       Min Buffer Use : %u\n", min);
 // seq_printf(s, "       Max Buffer Use : %u\n", max);
 // seq_printf(s, "       Avg Buffer Use : %u\n", avg);
-// seq_printf(s, "       Tot Buffer Use : %u\n", sum);
+   seq_printf(s, "       Tot Buffer Use : %u\n", sum);
 
    seq_printf(s, "\n");
    seq_printf(s, "---- Write Buffers (Software->Firmware) ---\n");
@@ -1428,7 +1547,7 @@ int Dma_SeqShow(struct seq_file *s, void *v) {
 // seq_printf(s, "       Min Buffer Use : %u\n", min);
 // seq_printf(s, "       Max Buffer Use : %u\n", max);
 // seq_printf(s, "       Avg Buffer Use : %u\n", avg);
-// seq_printf(s, "       Tot Buffer Use : %u\n", sum);
+   seq_printf(s, "       Tot Buffer Use : %u\n", sum);
    seq_printf(s, "\n");
 
    return 0;
@@ -1514,10 +1633,10 @@ int32_t Dma_WriteRegister(struct DmaDevice *dev, uint64_t arg) {
    struct DmaRegisterData rData;
 
    // Attempt to copy register data from user space
-   ret = copy_from_user(&rData, (void *)arg, sizeof(struct DmaRegisterData));
+   ret = copy_from_user(&rData, (__user void *)arg, sizeof(struct DmaRegisterData));
    if (ret) {
       dev_warn(dev->device, "Dma_WriteRegister: copy_from_user failed. ret=%llu, user=%p kern=%p\n",
-               ret, (void *)arg, &rData);
+               ret, (__user void *)arg, &rData);
       return -1;
    }
 
@@ -1550,7 +1669,7 @@ int32_t Dma_ReadRegister(struct DmaDevice *dev, uint64_t arg) {
    struct DmaRegisterData rData;
 
    // Attempt to copy DmaRegisterData structure from user space
-   if ((ret = copy_from_user(&rData, (void *)arg, sizeof(struct DmaRegisterData)))) {
+   if ((ret = copy_from_user(&rData, (__user void *)arg, sizeof(struct DmaRegisterData)))) {
       dev_warn(dev->device, "Dma_ReadRegister: copy_from_user failed. ret=%llu, user=%p kern=%p\n", ret, (void *)arg, &rData);
       return -1;
    }
@@ -1565,8 +1684,8 @@ int32_t Dma_ReadRegister(struct DmaDevice *dev, uint64_t arg) {
    rData.data = readl(dev->base + rData.address);
 
    // Attempt to copy the updated DmaRegisterData structure back to user space
-   if ((ret = copy_to_user((void *)arg, &rData, sizeof(struct DmaRegisterData)))) {
-      dev_warn(dev->device, "Dma_ReadRegister: copy_to_user failed. ret=%llu, user=%p kern=%p\n", ret, (void *)arg, &rData);
+   if ((ret = copy_to_user((__user void *)arg, &rData, sizeof(struct DmaRegisterData)))) {
+      dev_warn(dev->device, "Dma_ReadRegister: copy_to_user failed. ret=%llu, user=%p kern=%p\n", ret, (__user void *)arg, &rData);
       return -1;
    }
 

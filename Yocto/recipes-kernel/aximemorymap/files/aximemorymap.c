@@ -90,6 +90,7 @@ struct class *gCl = NULL;
  *    Maps file operations to the corresponding device driver functions.
  */
 struct file_operations MapFunctions = {
+   .owner          = THIS_MODULE,
    .read           = Map_Read,
    .write          = Map_Write,
    .open           = Map_Open,
@@ -111,10 +112,12 @@ struct file_operations MapFunctions = {
  * Note: The permissions set by this callback can be overridden by udev rules on
  * systems where udev is responsible for device node creation and management.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-char *Map_DevNode(struct device *dev, umode_t *mode) {
-#else
+// class.devnode() became const in v6.2 (upstream commit ff62b8e6588f),
+// backported by RHEL 9.4. Distinct from the class_create() change in v6.4.
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0) || (defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 4))
 char *Map_DevNode(const struct device *dev, umode_t *mode) {
+#else
+char *Map_DevNode(struct device *dev, umode_t *mode) {
 #endif
    if (mode != NULL) *mode = 0666;  // Set default permissions to read and write for user, group, and others
    return NULL;  // Return NULL as no specific device node name alteration is required
@@ -160,10 +163,10 @@ int Map_Init(void) {
 
    // Step 4: Create a device class
    pr_info("%s: Init: Creating device class\n", MOD_NAME);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-   gCl = class_create(THIS_MODULE, dev.devName);
-#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0) || (defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 4))
    gCl = class_create(dev.devName);
+#else
+   gCl = class_create(THIS_MODULE, dev.devName);
 #endif
    if (IS_ERR(gCl)) {
       pr_err("%s: Init: Failed to create device class\n", MOD_NAME);
@@ -173,7 +176,7 @@ int Map_Init(void) {
    gCl->devnode = Map_DevNode;
 
    // Step 5: Create a device file
-   if (device_create(gCl, NULL, dev.devNum, NULL, dev.devName) == NULL) {
+   if (IS_ERR_OR_NULL(device_create(gCl, NULL, dev.devNum, NULL, "%s", dev.devName))) {
       pr_err("%s: Init: Failed to create device file\n", MOD_NAME);
       class_destroy(gCl);  // Clean up on failure
       unregister_chrdev_region(dev.devNum, 1);
@@ -185,7 +188,7 @@ int Map_Init(void) {
    dev.major = MAJOR(dev.devNum);
 
    // Step 7: Add the character device
-   if (cdev_add(&dev.charDev, dev.devNum, 1) == -1) {
+   if (cdev_add(&dev.charDev, dev.devNum, 1) < 0) {
       pr_err("%s: Init: Failed to add device file.\n", MOD_NAME);
       device_destroy(gCl, dev.devNum);  // Clean up on failure
       class_destroy(gCl);
@@ -236,13 +239,24 @@ int Map_Init(void) {
 void Map_Exit(void) {
    struct MemMap *tmp, *next;
 
-   // Destroy the device (removes device file)
-   device_destroy(gCl, dev.devNum);
+   // Reverse-order teardown of Map_Init.
 
-   // Unregister Device Driver
+   // Step 7 undo: remove character device
+   cdev_del(&dev.charDev);
+
+   // Step 5 undo: destroy device file
+   if (gCl != NULL) device_destroy(gCl, dev.devNum);
+
+   // Step 4 undo: destroy the device class
+   if (gCl != NULL) {
+      class_destroy(gCl);
+      gCl = NULL;
+   }
+
+   // Step 3 undo: unregister char device region
    unregister_chrdev_region(dev.devNum, 1);
 
-   // Unmap and release allocated memory
+   // Step 8/9 undo: unmap and release allocated memory maps
    tmp = dev.maps;
    while (tmp != NULL) {
       next = tmp->next;
@@ -250,12 +264,7 @@ void Map_Exit(void) {
       kfree(tmp);
       tmp = next;
    }
-
-   // Destroy the device class
-   if (gCl != NULL) {
-      class_destroy(gCl);
-      gCl = NULL;
-   }
+   dev.maps = NULL;
 
    pr_info("%s: Clean: Module unloaded successfully.\n", MOD_NAME);
 }

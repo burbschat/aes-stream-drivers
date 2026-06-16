@@ -30,32 +30,42 @@
 #include <linux/seq_file.h>
 #include <linux/signal.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 #include <axis_gen2.h>
+#include <GpuAsync.h>
 
 #ifdef DATA_GPU
-#include <GpuAsync.h>
 #include <GpuAsyncRegs.h>
 #include <gpu_async.h>
 #endif
 
+// PCI_IRQ_LEGACY was renamed to PCI_IRQ_INTX in Linux 6.11; the old name was
+// kept as a deprecated alias for a few releases, then dropped. Provide the new
+// spelling on pre-6.11 kernels so the single pci_alloc_irq_vectors() call site
+// builds across the CI matrix (Ubuntu 22.04 / kernel 5.15 lacks PCI_IRQ_INTX).
+#ifndef PCI_IRQ_INTX
+#define PCI_IRQ_INTX PCI_IRQ_LEGACY
+#endif
+
 // Init Configuration values
-int cfgTxCount  = 1024;
-int cfgRxCount  = 1024;
-int cfgSize     = 0x20000;  // 128kB
-int cfgMode     = BUFF_COHERENT;
-int cfgCont     = 1;
-int cfgIrqHold  = 10000;
-int cfgIrqDis   = 0;
-int cfgBgThold0 = 0;
-int cfgBgThold1 = 0;
-int cfgBgThold2 = 0;
-int cfgBgThold3 = 0;
-int cfgBgThold4 = 0;
-int cfgBgThold5 = 0;
-int cfgBgThold6 = 0;
-int cfgBgThold7 = 0;
-int cfgDevName  = 0;
-int cfgTimeout  = 0xFFFF;
+static int cfgTxCount  = 1024;
+static int cfgRxCount  = 1024;
+static int cfgSize     = 0x20000;  // 128kB
+static int cfgMode     = BUFF_COHERENT;
+static int cfgCont     = 1;
+static int cfgIrqHold  = 10000;
+static int cfgIrqDis   = 0;
+static int cfgBgThold0 = 0;
+static int cfgBgThold1 = 0;
+static int cfgBgThold2 = 0;
+static int cfgBgThold3 = 0;
+static int cfgBgThold4 = 0;
+static int cfgBgThold5 = 0;
+static int cfgBgThold6 = 0;
+static int cfgBgThold7 = 0;
+static int cfgDevName  = 0;
+static int cfgTimeout  = 0xFFFF;
+static int cfgDebug    = 0;
 
 // Probe failure global flag used in driver init
 // function to unregister driver
@@ -110,6 +120,8 @@ int32_t DataDev_Init(void) {
 
    /* Clear memory for all DMA devices */
    memset(gDmaDevices, 0, sizeof(struct DmaDevice) * MAX_DMA_DEVICES);
+
+   pr_info("%s: aes-stream-drivers %s\n", MOD_NAME, GITV);
 
    pr_info("%s: Init\n", MOD_NAME);
 
@@ -213,7 +225,7 @@ int DataDev_Probe(struct pci_dev *pcidev, const struct pci_device_id *dev_id) {
    // Activate the PCI device
    ret = pci_enable_device(pcidev);
    if (ret) {
-      pr_err("%s: Probe: pci_enable_device() = %i.\n", MOD_NAME, ret);
+      dev_err(&pcidev->dev, "%s: Probe: pci_enable_device() = %i.\n", MOD_NAME, ret);
       probeReturn = ret;  // Return directly with error code
       goto err_pre_en;    // Bail out, but clean up first
    }
@@ -222,6 +234,34 @@ int DataDev_Probe(struct pci_dev *pcidev, const struct pci_device_id *dev_id) {
    // Retrieve and store the base address and size of the device's register space
    dev->baseAddr = pci_resource_start(pcidev, 0);
    dev->baseSize = pci_resource_len(pcidev, 0);
+
+   // Early out if we have an invalid BAR
+   if ( dev->baseAddr == 0 ) {
+      dev_err(&pcidev->dev, "Init: failed to get pci base address; check your BAR0 assignment!\n");
+      probeReturn = 0;  // Allow cards with valid BAR to load
+      goto err_post_en;
+   }
+
+   // The driver's register map tops out at a fixed 16 MB window (2 * USER_SIZE:
+   // DMA engine (AGEN2_OFF), PCIe PHY (PHY_OFF), AxiVersion (AVER_OFF), and the
+   // user region: rwBase = base + PHY_OFF, rwSize = 2*USER_SIZE - PHY_OFF). A
+   // BAR0 *larger* than this means the firmware was built with a different
+   // address map, so reject it with a clear message instead of letting the
+   // mismatch surface later. A smaller BAR0 is tolerated: the emulator shrinks
+   // its BAR when it cannot reserve 16 MB of contiguous memory, and only the
+   // lower register regions are exercised in that configuration.
+   if ( dev->baseSize > (2 * USER_SIZE) ) {
+      dev_err(&pcidev->dev,
+              "%s: Probe: BAR0 size 0x%x exceeds expected 0x%x (16 MB); "
+              "firmware register-map mismatch.\n",
+              MOD_NAME, dev->baseSize, (unsigned int)(2 * USER_SIZE));
+      probeReturn = -EINVAL;
+      goto err_post_en;
+   }
+
+   // Set basic device attributes
+   dev->pcidev = pcidev;          // PCI device structure
+   dev->device = &(pcidev->dev);  // Device structure
 
    // Map the device's register space for use in the driver
    if ( Dma_MapReg(dev) < 0 ) {
@@ -246,21 +286,46 @@ int DataDev_Probe(struct pci_dev *pcidev, const struct pci_device_id *dev_id) {
    dev->cfgBgThold[6] = cfgBgThold6;   // Background threshold 6
    dev->cfgBgThold[7] = cfgBgThold7;   // Background threshold 7
    dev->cfgTimeout = cfgTimeout;
+   dev->debug = cfgDebug;
 
-
-   // Assign the IRQ number from the pci_dev structure
-   dev->irq = pcidev->irq;
-
-   // Check that we actually have an IRQ
-   if (dev->irq == 0) {
-      pr_err("%s: No IRQ associated with PCI device\n", MOD_NAME);
-      probeReturn = -EINVAL;
-      goto err_post_en;
+   // Allocate IRQ vectors: try MSI-X first, then MSI, then legacy INTx.
+   // pci_alloc_irq_vectors() walks the requested types in priority order
+   // and returns the count of vectors negotiated; pci_irq_vector(pdev, 0)
+   // returns the right Linux IRQ number regardless of which path won. A
+   // bitstream that advertises more than one type is tolerated for
+   // backwards compatibility with legacy PCIe IP cores that report
+   // INTx + MSI/MSI-X simultaneously: the cascade picks the highest
+   // priority kind that's actually advertised. Probe fails only if all
+   // three are unavailable.
+   ret = pci_alloc_irq_vectors(pcidev, 1, 1,
+                               PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX);
+   if (ret < 0) {
+      dev_err(&pcidev->dev,
+              "%s: Probe: pci_alloc_irq_vectors() = %i\n", MOD_NAME, ret);
+      probeReturn = ret;
+      goto err_unmap;
    }
 
+   // pci_irq_vector() returns a signed errno on failure; capture it in an
+   // int and reject < 0 before storing into the uint32_t dev->irq, otherwise
+   // a negative value would wrap to a bogus IRQ and reach request_irq().
+   ret = pci_irq_vector(pcidev, 0);
+   if (ret < 0) {
+      dev_err(&pcidev->dev,
+              "%s: Probe: pci_irq_vector() = %i\n", MOD_NAME, ret);
+      probeReturn = ret;
+      goto err_unmap;
+   }
+   dev->irq = ret;
+
+   dev_info(dev->device,
+            "Init: Probe: using %s interrupts, irq=%u\n",
+            pcidev->msix_enabled ? "MSI-X" :
+            pcidev->msi_enabled  ? "MSI"   : "legacy INTx",
+            dev->irq);
+
    // Set basic device context
-   dev->pcidev = pcidev;          // PCI device structure
-   dev->device = &(pcidev->dev);  // Device structure
+
    dev->hwFunc = hfunc;           // Hardware function pointer
 
    // Initialize device memory regions
@@ -292,19 +357,25 @@ int DataDev_Probe(struct pci_dev *pcidev, const struct pci_device_id *dev_id) {
          } else {
             dev_err(dev->device, "Init: Failed to set coherent DMA mask.\n");
             probeReturn = -EINVAL;
-            goto err_post_en;
+            goto err_unmap;
          }
       } else {
          dev_err(dev->device, "Init: Failed to set DMA mask.\n");
          probeReturn = -EINVAL;
-         goto err_post_en;
+         goto err_unmap;
       }
    }
 
-   // Initialize common DMA functionalities
-   if (Dma_Init(dev) < 0) {
-      probeReturn = -ENOMEM;      // Indicate memory allocation error
-      goto err_post_en;
+   // Initialize common DMA functionalities. Dma_Init's early
+   // failure paths (chrdev/class/device/proc) do not unmap the
+   // registers we mapped above, so route through err_unmap.
+   // Dma_UnmapReg is idempotent, so a double-unmap from a late
+   // Dma_Init failure path is harmless. Preserve Dma_Init's
+   // actual return code instead of forcing -ENOMEM, which
+   // would mask the real failure reason.
+   probeReturn = Dma_Init(dev);
+   if (probeReturn < 0) {
+      goto err_unmap;
    }
 
    // Log memory mapping information
@@ -317,6 +388,17 @@ int DataDev_Probe(struct pci_dev *pcidev, const struct pci_device_id *dev_id) {
    probeReturn = 0;                  // Set successful return code
    return probeReturn;               // Return success
 
+err_unmap:
+#ifdef DATA_GPU
+   // Gpu_Init may have allocated utilData before we got here.
+   // kfree(NULL) is a no-op, so this stays safe even when
+   // Gpu_Init never ran.
+   kfree(dev->utilData);
+   dev->utilData = NULL;
+#endif
+   Dma_UnmapReg(dev);               // Idempotent: safe even if Dma_MapReg never ran
+   pci_free_irq_vectors(pcidev);    // Releases MSI/MSI-X/INTx allocation; no-op if
+                                    // pci_alloc_irq_vectors failed or never ran
 err_post_en:
    pci_disable_device(pcidev);      // Disable PCI device on failure
 err_pre_en:
@@ -339,6 +421,17 @@ void DataDev_Remove(struct pci_dev *pcidev) {
 
    pr_info("%s: Remove: Remove called.\n", MOD_NAME);
 
+   // Skip devices with invalid BAR
+   if (pci_resource_start(pcidev, 0) == 0) {
+      pr_info("%s: Remove: Skipping device %04x:%02x:%02x.%d with invalid BAR0\n",
+         MOD_NAME,
+         pci_domain_nr(pcidev->bus),
+         pcidev->bus->number,
+         PCI_SLOT(pcidev->devfn),
+         PCI_FUNC(pcidev->devfn));
+      return;
+   }
+
    // Look for matching device
    for (x = 0; x < MAX_DMA_DEVICES; x++) {
       if (gDmaDevices[x].baseAddr == pci_resource_start(pcidev, 0)) {
@@ -356,8 +449,21 @@ void DataDev_Remove(struct pci_dev *pcidev) {
    // Decrement count
    gDmaDevCount--;
 
-   // Call common DMA clean function
+#ifdef DATA_GPU
+   // Free GPU utility data allocated by Gpu_Init. gpu_async.c
+   // does not own its teardown path; release here so unload
+   // does not leak the kzalloc.
+   if (dev->utilData != NULL) {
+      kfree(dev->utilData);
+      dev->utilData = NULL;
+   }
+#endif
+
+   // Call common DMA clean function (calls free_irq() internally)
    Dma_Clean(dev);
+
+   // Release MSI/MSI-X/INTx vectors (must follow free_irq, precede pci_disable_device)
+   pci_free_irq_vectors(pcidev);
 
    // Disable device
    pci_disable_device(pcidev);
@@ -377,20 +483,29 @@ void DataDev_Remove(struct pci_dev *pcidev) {
  * function for further processing. The function returns the result of
  * the command execution, which could be a success indicator or an error code.
  *
- * Return: the result of the command execution. Returns -1 if the command
- * is not recognized.
+ * Return: the result of the command execution. Returns -EBADRQC (bad request number)
+ * if the command is not recognized.
  */
 int32_t DataDev_Command(struct DmaDevice *dev, uint32_t cmd, uint64_t arg) {
    switch (cmd) {
-#ifdef DATA_GPU
       // GPU Commands
       // Handles adding or removing Nvidia memory based on the command specified.
       case GPU_Add_Nvidia_Memory:
       case GPU_Rem_Nvidia_Memory:
       case GPU_Set_Write_Enable:
-         return dev->gpuEn ? Gpu_Command(dev, cmd, arg) : -1;
+      case GPU_Get_Gpu_Async_Ver:
+      case GPU_Get_Max_Buffers:
+#ifdef DATA_GPU
+         return dev->gpuEn ? Gpu_Command(dev, cmd, arg) : -ENOTSUPP;
+#else
+         return -ENOTSUPP;
 #endif
-
+      case GPU_Is_Gpu_Async_Supp:
+#ifdef DATA_GPU
+         return dev->gpuEn ? 1 : 0;
+#else
+         return 0;
+#endif
       case AVER_Get:
          // AXI Version Read
          return AxiVersion_Get(dev, dev->base + AVER_OFF, arg);
@@ -401,7 +516,7 @@ int32_t DataDev_Command(struct DmaDevice *dev, uint32_t cmd, uint64_t arg) {
          return AxisG2_Command(dev, cmd, arg);
          break;
    }
-   return -1;
+   return -EINVAL;
 }
 
 /**
@@ -467,6 +582,7 @@ struct hardware_functions DataDev_functions = {
    .init         = AxisG2_Init,
    .clear        = AxisG2_Clear,
    .enable       = AxisG2_Enable,
+   .irqEnable    = AxisG2_IrqEnable,
    .retRxBuffer  = AxisG2_RetRxBuffer,
    .sendBuffer   = AxisG2_SendBuffer,
    .command      = DataDev_Command,
@@ -524,3 +640,6 @@ MODULE_PARM_DESC(cfgDevName, "Device Name Formating Setting");
 
 module_param(cfgTimeout, int, 0);
 MODULE_PARM_DESC(cfgTimeout, "Internal DMA transfer timeout duration (cycles)");
+
+module_param(cfgDebug, int, 0);
+MODULE_PARM_DESC(cfgDebug, "Enables very verbose debug logging. Use this with caution!");

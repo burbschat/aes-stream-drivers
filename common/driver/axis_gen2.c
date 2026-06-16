@@ -46,6 +46,7 @@ struct hardware_functions AxisG2_functions = {
    .init         = AxisG2_Init,
    .enable       = AxisG2_Enable,
    .clear        = AxisG2_Clear,
+   .irqEnable    = AxisG2_IrqEnable,
    .retRxBuffer  = AxisG2_RetRxBuffer,
    .sendBuffer   = AxisG2_SendBuffer,
    .command      = AxisG2_Command,
@@ -131,7 +132,7 @@ inline uint8_t AxisG2_MapReturn(struct DmaDevice * dev, struct AxisG2Return *ret
  * of free buffers. It writes the buffer index and, if enabled, the buffer handle
  * to the device's write FIFOs to mark the buffer as free.
  */
-inline void AxisG2_WriteFree(struct DmaBuffer *buff, struct AxisG2Reg *reg, uint32_t desc128En) {
+inline void AxisG2_WriteFree(struct DmaBuffer *buff, __iomem struct AxisG2Reg *reg, uint32_t desc128En) {
    uint32_t wrData[2];
 
    // Mask the buffer index to fit within the 28-bit field
@@ -170,14 +171,14 @@ inline void AxisG2_WriteFree(struct DmaBuffer *buff, struct AxisG2Reg *reg, uint
  * the appropriate FIFO for transmission based on the descriptor size
  * enabled by the `desc128En` flag.
  */
-inline void AxisG2_WriteTx(struct DmaBuffer *buff, struct AxisG2Reg *reg, uint32_t desc128En) {
+inline void AxisG2_WriteTx(struct DmaBuffer *buff, __iomem struct AxisG2Reg *reg, uint32_t desc128En) {
    uint32_t rdData[4];
    uint32_t dest;
    uint32_t chan;
 
    // Configure buffer flags for transmission
    rdData[0]  = (buff->flags >> 13) & 0x00000008;  // bit[3] = continue = flags[16]
-   rdData[0]  = (buff->flags >> 13) & 0x00000010;  // bit[4] = timeout = flags[17]
+   rdData[0] |= (buff->flags >> 13) & 0x00000010;  // bit[4] = timeout = flags[17]
    rdData[0] |= (buff->flags <<  8) & 0x00FF0000;  // Bits[23:16] = lastUser = flags[15:8]
    rdData[0] |= (buff->flags << 24) & 0xFF000000;  // Bits[31:24] = firstUser = flags[7:0]
 
@@ -227,7 +228,7 @@ inline void AxisG2_WriteTx(struct DmaBuffer *buff, struct AxisG2Reg *reg, uint32
  *
  * Returns: Number of processed items
  */
-uint32_t AxisG2_Process(struct DmaDevice * dev, struct AxisG2Reg *reg, struct AxisG2Data *hwData) {
+uint32_t AxisG2_Process(struct DmaDevice * dev, __iomem struct AxisG2Reg *reg, struct AxisG2Data *hwData) {
    struct DmaDesc *desc;
    struct DmaBuffer *buff;
    struct AxisG2Return ret;
@@ -333,7 +334,11 @@ uint32_t AxisG2_Process(struct DmaDevice * dev, struct AxisG2Reg *reg, struct Ax
              dmaRxBufferIrq(desc, buff);
          }
       } else {
-          dev_warn(dev->device, "Process: Failed to locate RX buffer index %i.\n", ret.index);
+          // Rate-limited: during rmmod-under-load this can fire per-descriptor
+          // as buffers are torn down concurrently.  An unrate-limited dev_warn
+          // under maskLock can saturate the console path and deadlock against
+          // Dma_Release which also needs maskLock.
+          dev_warn_ratelimited(dev->device, "Process: Failed to locate RX buffer index %i.\n", ret.index);
       }
 
       // Update write index
@@ -373,11 +378,11 @@ uint32_t AxisG2_Process(struct DmaDevice * dev, struct AxisG2Reg *reg, struct Ax
  */
 irqreturn_t AxisG2_Irq(int irq, void *dev_id) {
    struct DmaDevice *dev;
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct AxisG2Data *hwData;
 
    dev = (struct DmaDevice *)dev_id;
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
    hwData = (struct AxisG2Data *)dev->hwData;
 
    // Disable interrupt
@@ -405,22 +410,26 @@ irqreturn_t AxisG2_Irq(int irq, void *dev_id) {
  * This includes setting up DMA buffers, configuring hardware registers, and initializing
  * software queues for efficient DMA transfers.
  */
-void AxisG2_Init(struct DmaDevice *dev) {
+int AxisG2_Init(struct DmaDevice *dev) {
    uint32_t x;
    uint32_t size;
 
    struct DmaBuffer  *buff;
    struct AxisG2Data *hwData;
-   struct AxisG2Reg  *reg;
+   __iomem struct AxisG2Reg  *reg;
 
    // Map device registers for access
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
 
    // Initialize destination mask to all 1's
    memset(dev->destMask, 0xFF, DMA_MASK_SIZE);
 
    // Allocate and initialize hardware data structure
    hwData = (struct AxisG2Data *)kzalloc(sizeof(struct AxisG2Data), GFP_KERNEL);
+   if (hwData == NULL) {
+      dev_err(dev->device, "Init: Failed to allocate AxisG2Data.\n");
+      return -ENOMEM;
+   }
    dev->hwData = hwData;
    hwData->dev = dev;
 
@@ -434,11 +443,28 @@ void AxisG2_Init(struct DmaDevice *dev) {
    hwData->hwWrBuffCnt = 0;
    hwData->hwRdBuffCnt = 0;
 
-   // Initialize software queues if in 128-bit descriptor mode
+   // Initialize software queues if in 128-bit descriptor mode.
+   // dmaQueueInit returns 0 on success-with-zero-elements *and*
+   // on failure, so test queue->queue (NULL on failure) for an
+   // unambiguous result. The cleanup goto for each step targets
+   // the matching err_free_<queue> label so the partially-built
+   // queue is freed via dmaQueueFree.
    if ( hwData->desc128En ) {
       dmaQueueInit(&hwData->wrQueue, dev->rxBuffers.count);
+      if (hwData->wrQueue.queue == NULL) {
+         dev_err(dev->device, "Init: Failed to init wrQueue.\n");
+         goto err_free_wrqueue;
+      }
       dmaQueueInit(&hwData->rdQueue, dev->txBuffers.count + dev->rxBuffers.count);
-      hwData->buffList = (struct DmaBuffer **)kzalloc(BUFF_LIST_SIZE * sizeof(struct DmaBuffer *), GFP_ATOMIC);
+      if (hwData->rdQueue.queue == NULL) {
+         dev_err(dev->device, "Init: Failed to init rdQueue.\n");
+         goto err_free_rdqueue;
+      }
+      hwData->buffList = (struct DmaBuffer **)kzalloc(BUFF_LIST_SIZE * sizeof(struct DmaBuffer *), GFP_KERNEL);
+      if (hwData->buffList == NULL) {
+         dev_err(dev->device, "Init: Failed to allocate buffList.\n");
+         goto err_free_rdqueue;
+      }
    }
 
    // Calculate and set the addressable space based on register settings
@@ -448,14 +474,30 @@ void AxisG2_Init(struct DmaDevice *dev) {
    // Allocate DMA buffers based on configuration mode
    if (dev->cfgMode & AXIS2_RING_ACP) {
       // Allocate read and write buffers in contiguous physical memory
-      hwData->readAddr   = kzalloc(size, GFP_DMA | GFP_KERNEL);
+      hwData->readAddr = kzalloc(size, GFP_KERNEL);
+      if (hwData->readAddr == NULL) {
+         dev_err(dev->device, "Init: Failed to allocate read ring (size=%u).\n", size);
+         goto err_free_bufflist;
+      }
       hwData->readHandle = virt_to_phys(hwData->readAddr);
-      hwData->writeAddr   = kzalloc(size, GFP_DMA | GFP_KERNEL);
+      hwData->writeAddr = kzalloc(size, GFP_KERNEL);
+      if (hwData->writeAddr == NULL) {
+         dev_err(dev->device, "Init: Failed to allocate write ring (size=%u).\n", size);
+         goto err_free_readaddr_acp;
+      }
       hwData->writeHandle = virt_to_phys(hwData->writeAddr);
    } else {
       // Allocate coherent DMA buffers for read and write operations
-      hwData->readAddr = dma_alloc_coherent(dev->device, size, &(hwData->readHandle), GFP_DMA | GFP_KERNEL);
-      hwData->writeAddr = dma_alloc_coherent(dev->device, size, &(hwData->writeHandle), GFP_DMA | GFP_KERNEL);
+      hwData->readAddr = dma_alloc_coherent(dev->device, size, &(hwData->readHandle), GFP_KERNEL);
+      if (hwData->readAddr == NULL) {
+         dev_err(dev->device, "Init: dma_alloc_coherent failed for read ring (size=%u).\n", size);
+         goto err_free_bufflist;
+      }
+      hwData->writeAddr = dma_alloc_coherent(dev->device, size, &(hwData->writeHandle), GFP_KERNEL);
+      if (hwData->writeAddr == NULL) {
+         dev_err(dev->device, "Init: dma_alloc_coherent failed for write ring (size=%u).\n", size);
+         goto err_free_readaddr_dma;
+      }
    }
 
    // Log buffer addresses
@@ -500,13 +542,19 @@ void AxisG2_Init(struct DmaDevice *dev) {
    if ( dev->version >= 3 ) writel(dev->cfgIrqHold, &(reg->irqHoldOff));
    if ( dev->version >= 5 ) writel(dev->cfgTimeout, &(reg->timeout));
 
-   // Push RX buffers to hardware and map
+   // Push RX buffers to hardware and map. A per-buffer map failure means
+   // the RX ring would come up partially primed -- a broken driver state
+   // -- so fail init and unwind through the cleanup chain.
    for (x=dev->rxBuffers.baseIdx; x < (dev->rxBuffers.baseIdx + dev->rxBuffers.count); x++) {
       buff = dmaGetBufferList(&(dev->rxBuffers), x);
 
       // Map failure
       if ( dmaBufferToHw(buff) < 0 ) {
-          dev_warn(dev->device, "Init: Failed to map dma buffer.\n");
+         dev_err(dev->device, "Init: Failed to map dma buffer.\n");
+         if (dev->cfgMode & AXIS2_RING_ACP)
+            goto err_free_writeaddr_acp;
+         else
+            goto err_free_writeaddr_dma;
 
       // Add to software queue, if enabled and hardware is full
       } else if ( hwData->desc128En && (hwData->hwWrBuffCnt >= (hwData->addrCount-1)) ) {
@@ -529,6 +577,32 @@ void AxisG2_Init(struct DmaDevice *dev) {
    }
 
    dev_info(dev->device, "Init: Found Version 2 Device. Desc128En=%i\n", hwData->desc128En);
+   return 0;
+
+   // Allocation failure cleanup. dev->hwData is left NULL so
+   // AxisG2_Clear (not invoked here) is never called with a
+   // half-built hwData. RX buffers already pushed to hardware
+   // are reclaimed by Dma_Init via cleanup_rx_buffers.
+err_free_writeaddr_dma:
+   dma_free_coherent(dev->device, size, hwData->writeAddr, hwData->writeHandle);
+   goto err_free_readaddr_dma;
+err_free_writeaddr_acp:
+   kfree(hwData->writeAddr);
+   goto err_free_readaddr_acp;
+err_free_readaddr_dma:
+   dma_free_coherent(dev->device, size, hwData->readAddr, hwData->readHandle);
+   goto err_free_bufflist;
+err_free_readaddr_acp:
+   kfree(hwData->readAddr);
+err_free_bufflist:
+   if (hwData->desc128En) kfree(hwData->buffList);
+err_free_rdqueue:
+   if (hwData->desc128En) dmaQueueFree(&hwData->rdQueue);
+err_free_wrqueue:
+   if (hwData->desc128En) dmaQueueFree(&hwData->wrQueue);
+   kfree(hwData);
+   dev->hwData = NULL;
+   return -ENOMEM;
 }
 
 /**
@@ -542,10 +616,10 @@ void AxisG2_Init(struct DmaDevice *dev) {
  * a workqueue if required, based on the device's configuration.
  */
 void AxisG2_Enable(struct DmaDevice *dev) {
-   struct AxisG2Reg  *reg;
+   __iomem struct AxisG2Reg  *reg;
    struct AxisG2Data *hwData;
 
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
    hwData = (struct AxisG2Data *)dev->hwData;
 
    // Enable the device by setting the enable version and online registers
@@ -554,8 +628,6 @@ void AxisG2_Enable(struct DmaDevice *dev) {
 
    // Check if descriptor 128-bit enable flag is set
    if (hwData->desc128En) {
-      hwData->wqEnable = 1;
-
       // Configure workqueue and delayed work for interrupt handling or polling
       if (!dev->cfgIrqDis) {
          // Create a single-thread workqueue for interrupt handling
@@ -571,21 +643,33 @@ void AxisG2_Enable(struct DmaDevice *dev) {
          INIT_WORK(&(hwData->irqWork), AxisG2_WqTask_Poll);
          queue_work_on((int)dev->cfgIrqDis, hwData->wq, &(hwData->irqWork));
       }
+
+      // Enable the work queue only after we've allocated all resources
+      hwData->wqEnable = 1;
    } else {
       hwData->wqEnable = 0;
-   }
-
-   // Enable interrupt handling if not disabled by configuration
-   if (!dev->cfgIrqDis) {
-      writel(0x1, &(reg->intEnable));
    }
 
    // Re-enable the device and online status to ensure settings take effect
    writel(0x1, &(reg->enableVer));
    writel(0x1, &(reg->online));
 
-   // Re-enable interrupt handling as a final step
-   writel(0x1, &(reg->intEnable));
+   // Enable interrupt handling if not disabled by configuration
+   if (!dev->cfgIrqDis) {
+      writel(0x1, &(reg->intEnable));
+   }
+}
+
+/**
+ * AxisG2_IrqEnable - Mask or unmask IRQs on the device
+ * @dev: Pointer to the device structure
+ * @en: 1 to enable interrupts, 0 to disable
+ *
+ * This function simply masks interrupts
+ */
+void AxisG2_IrqEnable(struct DmaDevice *dev, int en) {
+   __iomem struct AxisG2Reg *reg = (__iomem struct AxisG2Reg*)dev->reg;
+   writel(en ? 0x1 : 0x0, &(reg->intEnable));
 }
 
 /**
@@ -599,11 +683,11 @@ void AxisG2_Enable(struct DmaDevice *dev) {
  * cleaning up the device.
  */
 void AxisG2_Clear(struct DmaDevice *dev) {
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct AxisG2Data *hwData;
    size_t size;
 
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
    hwData = (struct AxisG2Data *)dev->hwData;
 
    // Disable interrupts to prevent further device activity.
@@ -666,11 +750,11 @@ void AxisG2_Clear(struct DmaDevice *dev) {
  * in 128-bit descriptor mode.
  */
 void AxisG2_RetRxBuffer(struct DmaDevice *dev, struct DmaBuffer **buff, uint32_t count) {
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct AxisG2Data *hwData;
    uint32_t x;
 
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
    hwData = (struct AxisG2Data *)dev->hwData;
 
    // Prepare for hardware interaction
@@ -720,11 +804,11 @@ void AxisG2_RetRxBuffer(struct DmaDevice *dev, struct DmaBuffer **buff, uint32_t
  */
 int32_t AxisG2_SendBuffer(struct DmaDevice *dev, struct DmaBuffer **buff, uint32_t count) {
    struct AxisG2Data *hwData;
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    unsigned long iflags;
    uint32_t x;
 
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
    hwData = (struct AxisG2Data *)dev->hwData;
 
    // Prepare buffers for hardware transmission
@@ -765,8 +849,8 @@ int32_t AxisG2_SendBuffer(struct DmaDevice *dev, struct DmaBuffer **buff, uint32
  *---------------------------------------------------------------------------
  */
 int32_t AxisG2_Command(struct DmaDevice *dev, uint32_t cmd, uint64_t arg) {
-   struct AxisG2Reg *reg;
-   reg = (struct AxisG2Reg *)dev->reg;
+   __iomem struct AxisG2Reg *reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
 
    switch (cmd) {
       case AXIS_Read_Ack:
@@ -804,15 +888,16 @@ int32_t AxisG2_Command(struct DmaDevice *dev, uint32_t cmd, uint64_t arg) {
  * and readability.
  */
 void AxisG2_SeqShow(struct seq_file *s, struct DmaDevice *dev) {
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct AxisG2Data *hwData;
    uint32_t x;
 
-   reg = (struct AxisG2Reg *)dev->reg;
+   reg = (__iomem struct AxisG2Reg *)dev->reg;
    hwData = (struct AxisG2Data *)dev->hwData;
 
    seq_printf(s, "\n");
    seq_printf(s, "---------- DMA Firmware General ----------\n");
+   seq_printf(s, "                    IRQ : %u\n", dev->irq);
    seq_printf(s, "          Int Req Count : %u\n", (readl(&(reg->intReqCount))));
    seq_printf(s, "        Hw Dma Wr Index : %u\n", (readl(&(reg->hwWrIndex))));
    seq_printf(s, "        Sw Dma Wr Index : %u\n", hwData->writeIndex);
@@ -852,7 +937,7 @@ void AxisG2_SeqShow(struct seq_file *s, struct DmaDevice *dev) {
  *-------------------------------------------------------------------------------
  */
 void AxisG2_WqTask_IrqForce(struct work_struct *work) {
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct AxisG2Data *hwData;
    struct delayed_work *dlyWork;
 
@@ -862,7 +947,7 @@ void AxisG2_WqTask_IrqForce(struct work_struct *work) {
    hwData = container_of(dlyWork, struct AxisG2Data, dlyWork);
 
    // Access device registers
-   reg = (struct AxisG2Reg *)hwData->dev->reg;
+   reg = (__iomem struct AxisG2Reg *)hwData->dev->reg;
 
    // Force an interrupt
    writel(0x1, &(reg->forceInt));
@@ -884,7 +969,7 @@ void AxisG2_WqTask_IrqForce(struct work_struct *work) {
  */
 void AxisG2_WqTask_Poll(struct work_struct *work) {
    uint32_t handleCount;
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct DmaDevice *dev;
    struct AxisG2Data *hwData;
 
@@ -892,7 +977,7 @@ void AxisG2_WqTask_Poll(struct work_struct *work) {
    hwData = container_of(work, struct AxisG2Data, irqWork);
 
    // Retrieve device and register structures
-   reg = (struct AxisG2Reg *)hwData->dev->reg;
+   reg = (__iomem struct AxisG2Reg *)hwData->dev->reg;
    dev = (struct DmaDevice *)hwData->dev;
 
    // Process data and return the number of handled items
@@ -920,7 +1005,7 @@ void AxisG2_WqTask_Poll(struct work_struct *work) {
  */
 void AxisG2_WqTask_Service(struct work_struct *work) {
    uint32_t handleCount;
-   struct AxisG2Reg *reg;
+   __iomem struct AxisG2Reg *reg;
    struct DmaDevice *dev;
    struct AxisG2Data *hwData;
 
@@ -928,7 +1013,7 @@ void AxisG2_WqTask_Service(struct work_struct *work) {
    hwData = container_of(work, struct AxisG2Data, irqWork);
 
    // Cast device and register pointers from the hardware data
-   reg = (struct AxisG2Reg *)hwData->dev->reg;
+   reg = (__iomem struct AxisG2Reg *)hwData->dev->reg;
    dev = (struct DmaDevice *)hwData->dev;
 
    // Debug information: entering service routine

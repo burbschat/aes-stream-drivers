@@ -19,8 +19,24 @@ NAME := axi_stream_dma
 # Directory containing the Makefile
 HOME := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 
-# Version or identifier for this build
-GITV := yocto
+# Trust the worktree even when owned by a different user — required when
+# /etc/rc.local rebuilds drivers as root from a tree cloned by an
+# unprivileged user. System/global git config is suppressed so a hostile
+# core.fsmonitor / pager / credential helper there cannot ride along.
+GIT := GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null git -c safe.directory='*'
+
+# Automatically determine the git version (override via GITV=... from caller, e.g. recipe)
+ifndef GITV
+    GITT := $(shell cd $(HOME); $(GIT) describe --tags 2>/dev/null)
+    ifeq ($(GITT),)
+        GITT := $(shell cd $(HOME); $(GIT) rev-parse --short HEAD 2>/dev/null)
+    endif
+    ifeq ($(GITT),)
+        GITT := emulator
+    endif
+    GITD := $(shell cd $(HOME); $(GIT) status --short -uno 2>/dev/null | wc -l)
+    GITV := $(if $(filter $(GITD),0),$(GITT),$(GITT)-dirty)
+endif
 
 # Source files discovery within the same directory as the Makefile
 SRCS := $(wildcard $(HOME)/*.c)
@@ -36,6 +52,7 @@ ccflags-y := -I$(HOME)
 ccflags-y += -DDMA_IN_KERNEL=1 -DGITV=\"$(GITV)\"
 ccflags-y += -Wformat=0 -Wno-int-to-pointer-cast
 ccflags-y += -g -DDEBUG
+ccflags-y += "-DDMA_TX_BUFF_COUNT=$(DMA_TX_BUFF_COUNT)" "-DDMA_RX_BUFF_COUNT=$(DMA_RX_BUFF_COUNT)" "-DDMA_BUFF_SIZE=$(DMA_BUFF_SIZE)"
 
 # Object files needed for the kernel module
 $(NAME)-objs := dma_buffer.o dma_common.o axis_gen1.o axis_gen2.o axistreamdma.o

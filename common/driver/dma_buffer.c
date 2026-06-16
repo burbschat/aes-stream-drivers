@@ -83,6 +83,11 @@ size_t dmaAllocBuffers(struct DmaDevice *dev, struct DmaBufferList *list,
    // a single sorted list
    if ( (list->subCount == 1) && ((list->dev->cfgMode & BUFF_STREAM) == 0) ) {
       list->sorted = (struct DmaBuffer **) kzalloc(sizeof(struct DmaBuffer**) * count, GFP_KERNEL);
+      if (!list->sorted) {
+         dev_err(dev->device, "dmaAllocBuffers: Failed to allocate sorted buffer list of %ld bytes\n",
+            (ulong)(sizeof(struct DmaBuffer**) * count));
+         goto cleanup_buffers;
+      }
    }
 
    // Allocate buffers
@@ -103,7 +108,7 @@ size_t dmaAllocBuffers(struct DmaDevice *dev, struct DmaBufferList *list,
       // Coherent buffer, map dma coherent buffers
       if ( list->dev->cfgMode & BUFF_COHERENT ) {
          buff->buffAddr =
-            dma_alloc_coherent(list->dev->device, list->dev->cfgSize, &(buff->buffHandle), GFP_DMA | GFP_KERNEL);
+            dma_alloc_coherent(list->dev->device, list->dev->cfgSize, &(buff->buffHandle), GFP_KERNEL);
 
       // Streaming buffer type, standard kernel memory
       } else if ( list->dev->cfgMode & BUFF_STREAM ) {
@@ -122,10 +127,9 @@ size_t dmaAllocBuffers(struct DmaDevice *dev, struct DmaBufferList *list,
             dev_err(list->dev->device, "dmaAllocBuffers(BUFF_STREAM): kmalloc Memory allocation failed\n");
          }
 #else
-         buff->buffAddr = dma_alloc_pages(list->dev->device, list->dev->cfgSize, &buff->buffHandle, direction, GFP_KERNEL);
-         // Check for mapping error
+         buff->buffAddr = dma_alloc_noncoherent(list->dev->device, list->dev->cfgSize, &buff->buffHandle, direction, GFP_KERNEL);
          if (buff->buffAddr == NULL) {
-            dev_err(dev->device, "dmaAllocBuffers(BUFF_STREAM): dma_alloc_pages failed\n");
+            dev_err(dev->device, "dmaAllocBuffers(BUFF_STREAM): dma_alloc_noncoherent failed\n");
          }
 #endif
 
@@ -159,13 +163,12 @@ size_t dmaAllocBuffers(struct DmaDevice *dev, struct DmaBufferList *list,
    /* Cleanup */
 cleanup_buffers:
    dmaFreeBuffersList(list);
-   if ( list->sorted  != NULL ) kfree(list->sorted);
+   kfree(list->sorted);
 
 cleanup_list_heads:
    for (x=0; x < list->subCount; x++)
-      if ( list->indexed[x] != NULL )
-         kfree(list->indexed[x]);
-   if ( list->indexed != NULL ) kfree(list->indexed);
+      kfree(list->indexed[x]);
+   kfree(list->indexed);
 
 // Return 0 as no buffers were allocated
 cleanup_forced_exit:
@@ -199,15 +202,26 @@ void dmaFreeBuffersList(struct DmaBufferList *list) {
                               list->indexed[sl][sli]->buffHandle);
          }
 
-         // Unmap streaming buffer
+         // Unmap and free streaming buffer
          if (list->dev->cfgMode & BUFF_STREAM) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
             dma_unmap_single(list->dev->device,
                              list->indexed[sl][sli]->buffHandle,
                              list->dev->cfgSize, list->direction);
+#else
+            dma_free_noncoherent(list->dev->device, list->dev->cfgSize,
+                                 list->indexed[sl][sli]->buffAddr,
+                                 list->indexed[sl][sli]->buffHandle,
+                                 list->direction);
+#endif
          }
 
-         // Free buffer for streaming type or ARM ACP
+         // Free buffer for streaming type (pre-5.15 only) or ARM ACP
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
          if ((list->dev->cfgMode & BUFF_STREAM) || (list->dev->cfgMode & BUFF_ARM_ACP)) {
+#else
+         if (list->dev->cfgMode & BUFF_ARM_ACP) {
+#endif
             kfree(list->indexed[sl][sli]->buffAddr);
          }
       }
@@ -659,10 +673,17 @@ size_t dmaQueueInit(struct DmaQueue *queue, uint32_t count) {
    return count;
 
 cleanup_sub_queue:
-   // Cleanup in case of allocation failure for sub-queues
-   for (x = 0; x < queue->subCount; x++)
-      if (queue->queue[x] != NULL)
+   // Cleanup in case of allocation failure for sub-queues.
+   // Free what we already allocated and NULL the entries so a
+   // subsequent dmaQueueFree call cannot double-free them.
+   for (x = 0; x < queue->subCount; x++) {
+      if (queue->queue[x] != NULL) {
          kfree(queue->queue[x]);
+         queue->queue[x] = NULL;
+      }
+   }
+   kfree(queue->queue);
+   queue->queue = NULL;
 
 cleanup_force_exit:
    // Return 0 to indicate failure to initialize the queue
@@ -681,12 +702,17 @@ void dmaQueueFree(struct DmaQueue *queue) {
    uint32_t x;
 
    queue->count = 0;
-   for (x = 0; x < queue->subCount; x++)
-      if (queue->queue[x] != NULL)
-         kfree(queue->queue[x]);
-
+   // Tolerate dmaQueueInit failure: queue->queue may be
+   // NULL while queue->subCount was already written. Skip
+   // the walk in that case so we do not deref NULL.
+   if (queue->queue != NULL) {
+      for (x = 0; x < queue->subCount; x++)
+         if (queue->queue[x] != NULL)
+            kfree(queue->queue[x]);
+      kfree(queue->queue);
+      queue->queue = NULL;
+   }
    queue->subCount = 0;
-   kfree(queue->queue);
 }
 
 /**

@@ -37,18 +37,30 @@
 #include <linux/of_irq.h>
 #include <linux/version.h>
 
+#ifndef DMA_TX_BUFF_COUNT
+#define DMA_TX_BUFF_COUNT 128
+#endif
+
+#ifndef DMA_RX_BUFF_COUNT
+#define DMA_RX_BUFF_COUNT 128
+#endif
+
+#ifndef DMA_BUFF_SIZE
+#define DMA_BUFF_SIZE 2097152
+#endif
+
 /* Transmission buffer count configurations */
-int cfgTxCount0 = 128;
+int cfgTxCount0 = DMA_TX_BUFF_COUNT;
 int cfgTxCount1 = 8;
 int cfgTxCount2 = 8;
 
 /* Reception buffer count configurations */
-int cfgRxCount0 = 128;
+int cfgRxCount0 = DMA_RX_BUFF_COUNT;
 int cfgRxCount1 = 8;
 int cfgRxCount2 = 8;
 
 /* Buffer size configurations (in bytes) */
-int cfgSize0    = 2097152;
+int cfgSize0    = DMA_BUFF_SIZE;
 int cfgSize1    = 4096;
 int cfgSize2    = 4096;
 
@@ -228,7 +240,7 @@ int Rce_Probe(struct platform_device *pdev) {
    dev->device = &(pdev->dev);
 
    // Map device memory to enable probing
-   if (Dma_MapReg(dev) < 0) return -1;
+   if (Dma_MapReg(dev) < 0) goto err_post_irq_map;
 
    // Configure device settings based on the selected index
    switch (tmpIdx) {
@@ -254,7 +266,7 @@ int Rce_Probe(struct platform_device *pdev) {
          dev->cfgIrqDis = cfgIrqDis2;
          break;
       default:
-         return -1;  // Invalid index
+         goto err_post_mapreg;  // Invalid index
    }
 
    dev->debug = debug;
@@ -270,7 +282,7 @@ int Rce_Probe(struct platform_device *pdev) {
       writel(0x1, ((uint8_t *)dev->reg) + 0x8);
       if (readl(((uint8_t *)dev->reg) + 0x8) != 0x1) {
          pr_info("%s: Probe: Empty register space. Exiting.\n", MOD_NAME);
-         return -1;
+         goto err_post_mapreg;
       }
       dev->hwFunc = &(AxisG1_functions);
    }
@@ -287,14 +299,18 @@ int Rce_Probe(struct platform_device *pdev) {
    if ((dev->cfgMode & BUFF_ARM_ACP) || (dev->cfgMode & AXIS2_RING_ACP)) {
       // Set DMA operations to coherent if supported
       set_dma_ops(&pdev->dev, &arm_coherent_dma_ops);
-      pr_info("%s: Probe: Set COHERENT DMA =%i\n", dev->device, dev->cfgMode);
+      pr_info("%s: Probe: Set COHERENT DMA =%i\n", MOD_NAME, dev->cfgMode);
    }
 #endif
 #endif
 
-   // Initialize DMA and check for success
+   // Initialize DMA and check for success. Dma_Init's late
+   // failure paths unwind via Dma_UnmapReg, but its early
+   // paths (chrdev/class/device/proc) do NOT — so we must
+   // always route through err_post_mapreg. Dma_UnmapReg is
+   // idempotent, so a double call is harmless.
    if (Dma_Init(dev) < 0)
-      return -1;  // Return error if DMA initialization fails
+      goto err_post_mapreg;
 
    // Successful DMA initialization increments device count
    gDmaDevCount++;
@@ -304,6 +320,13 @@ int Rce_Probe(struct platform_device *pdev) {
 
    // Return success
    return 0;
+
+err_post_mapreg:
+   Dma_UnmapReg(dev);
+err_post_irq_map:
+   irq_dispose_mapping(dev->irq);
+   memset(dev, 0, sizeof(*dev));
+   return -1;
 }
 
 /**
@@ -317,10 +340,15 @@ int Rce_Probe(struct platform_device *pdev) {
  *
  * @pdev: Platform device structure representing the DMA device.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 void Rce_Remove(struct platform_device *pdev) {
+#else
+int Rce_Remove(struct platform_device *pdev) {
+#endif
    int32_t x;
    const char *tmpName;
    int32_t tmpIdx;
+   unsigned int irq_to_dispose;
    struct DmaDevice *dev = NULL;
 
    pr_info("%s: Remove: Removal process initiated.\n", MOD_NAME);
@@ -343,17 +371,31 @@ void Rce_Remove(struct platform_device *pdev) {
    // Exit if no matching device is found
    if (tmpIdx < 0) {
       pr_info("%s: Remove: No matching device found.\n", MOD_NAME);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+      return -1;
+#else
       return;
+#endif
    }
 
    // Retrieve the device structure and update the global device count
    dev = &gDmaDevices[tmpIdx];
    gDmaDevCount--;
 
+   // Save the virtual IRQ before Dma_Clean zeros the device struct.
+   irq_to_dispose = dev->irq;
+
    // Invoke common cleanup operations for the DMA device
    Dma_Clean(dev);
 
+   // Release the virtual-IRQ mapping created in Rce_Probe.
+   // irq_dispose_mapping(0) is a no-op, so this is safe even if no IRQ was mapped.
+   irq_dispose_mapping(irq_to_dispose);
+
    pr_info("%s: Remove: Device removal completed.\n", MOD_NAME);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+   return 0;
+#endif
 }
 
 /**

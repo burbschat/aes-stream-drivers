@@ -37,7 +37,7 @@
  *
  * Return: 0 on success, -1 on failure to copy data to user space.
  */
-int32_t AxiVersion_Get(struct DmaDevice *dev, void *base, uint64_t arg) {
+int32_t AxiVersion_Get(struct DmaDevice *dev, __iomem void *base, uint64_t arg) {
    struct AxiVersion axiVersion;
    uint64_t ret;
 
@@ -45,12 +45,12 @@ int32_t AxiVersion_Get(struct DmaDevice *dev, void *base, uint64_t arg) {
    AxiVersion_Read(dev, base, &axiVersion);
 
    // Attempt to copy the AXI version information to user space
-   ret = copy_to_user((void *)arg, &axiVersion, sizeof(struct AxiVersion));
+   ret = copy_to_user((__user void *)arg, &axiVersion, sizeof(struct AxiVersion));
    if (ret) {
       // Log a warning if copy to user space fails
       dev_warn(dev->device,
                "AxiVersion_Get: copy_to_user failed. ret=%llu, user=%p kern=%p\n",
-               (unsigned long long)ret, (void *)arg, &axiVersion);
+               (unsigned long long)ret, (__user void *)arg, &axiVersion);
       return -1;
    }
    return 0;
@@ -67,8 +67,8 @@ int32_t AxiVersion_Get(struct DmaDevice *dev, void *base, uint64_t arg) {
  * scratch pad, up time count, feature descriptor value, user-defined values,
  * device ID, git hash, device DNA value, and build string.
  */
-void AxiVersion_Read(struct DmaDevice *dev, void * base, struct AxiVersion *aVer) {
-   struct AxiVersion_Reg *reg = (struct AxiVersion_Reg *)base;
+void AxiVersion_Read(struct DmaDevice *dev, __iomem void * base, struct AxiVersion *aVer) {
+   __iomem struct AxiVersion_Reg *reg = (__iomem struct AxiVersion_Reg *)base;
    uint32_t x;
 
    // Read firmware version, scratch pad, and uptime count
@@ -105,6 +105,31 @@ void AxiVersion_Read(struct DmaDevice *dev, void * base, struct AxiVersion *aVer
    }
 }
 
+// This should be kept in sync with axi-pcie-core's AxiPcieSharedPkg.vhd
+static const char* HardwareTypeLookup[] = {
+   "Undefined",            // 0x00_00_00_00
+   "AlphaDataKu3",         // 0x00_00_00_01
+   "BittWareXupVv8Vu13p",  // 0x00_00_00_02
+   "SlacPgpCardG3",        // 0x00_00_00_03
+   "SlacPgpCardG4",        // 0x00_00_00_04
+   "XilinxAc701",          // 0x00_00_00_05
+   "XilinxAlveoU50",       // 0x00_00_00_06
+   "XilinxAlveoU200",      // 0x00_00_00_07
+   "XilinxAlveoU250",      // 0x00_00_00_08
+   "XilinxAlveoU280",      // 0x00_00_00_09
+   "XilinxKc705",          // 0x00_00_00_0A
+   "XilinxKcu105",         // 0x00_00_00_0B
+   "XilinxKcu116",         // 0x00_00_00_0C
+   "XilinxKcu1500",        // 0x00_00_00_0D
+   "XilinxVcu128",         // 0x00_00_00_0E
+   "XilinxAlveoU55C",      // 0x00_00_00_0F
+   "XilinxVariumC1100",    // 0x00_00_00_10
+   "AbacoPc821Ku085",      // 0x00_00_00_11
+   "AbacoPc821Ku115",      // 0x00_00_00_12
+   "BittWareXupVv8Vu9p",   // 0x00_00_00_13
+};
+static const int HardwareTypeCount = sizeof(HardwareTypeLookup) / sizeof(HardwareTypeLookup[0]);
+
 /**
  * AxiVersion_Show - Display AXI version information.
  * @s: sequence file pointer to which this function will write.
@@ -120,6 +145,8 @@ void AxiVersion_Read(struct DmaDevice *dev, void * base, struct AxiVersion *aVer
 void AxiVersion_Show(struct seq_file *s, struct DmaDevice *dev, struct AxiVersion *aVer) {
    int32_t x;
    bool gitDirty = true;
+   MAYBE_UNUSED uint32_t htype, bifurcationIndex;
+   MAYBE_UNUSED const char *hwstr;
 
    seq_printf(s, "---------- Firmware Axi Version -----------\n");
    seq_printf(s, "     Firmware Version : 0x%x\n", aVer->firmwareVersion);
@@ -151,7 +178,20 @@ void AxiVersion_Show(struct seq_file *s, struct DmaDevice *dev, struct AxiVersio
    seq_printf(s, "\n");
 
    // Build string display
-   seq_printf(s, "         Build String : %s\n", aVer->buildString);
+   seq_printf(s, "         Build String : %s\n", (char*)aVer->buildString);
+
+   // Display hardware information (exclusive to PCIe driver)
+#ifdef PCIE_DMA
+   htype = aVer->userValues[AxiVersion_Usr_HardwareType_Offset] & 0xFFF;
+   bifurcationIndex = (aVer->userValues[AxiVersion_Usr_HardwareType_Offset] >> 12) & 0xF;
+   if (htype < HardwareTypeCount) {
+      hwstr = HardwareTypeLookup[htype];
+   } else {
+      hwstr = HardwareTypeLookup[0];
+   }
+   seq_printf(s, "        Hardware Type : %s (0x%03X)\n", hwstr, htype);
+   seq_printf(s, "    Bifurcation Index : %u\n", bifurcationIndex);
+#endif
 }
 
 /**
@@ -162,8 +202,8 @@ void AxiVersion_Show(struct seq_file *s, struct DmaDevice *dev, struct AxiVersio
  * This function sets or clears the user reset bit in the AXI version register based on the
  * provided state. It writes directly to the hardware register to effect this change.
  */
-void AxiVersion_SetUserReset(void *base, bool state) {
-   struct AxiVersion_Reg *reg = (struct AxiVersion_Reg *)base;
+void AxiVersion_SetUserReset(__iomem void *base, bool state) {
+   __iomem struct AxiVersion_Reg *reg = (__iomem struct AxiVersion_Reg *)base;
    uint32_t val;
 
    if (state) {

@@ -28,10 +28,13 @@ struct RceHpReg {
 };
 
 // Init card in top level Probe
-void RceHp_Init(struct DmaDevice *dev);
+int RceHp_Init(struct DmaDevice *dev);
 
 // Enable
 void RceHp_Enable(struct DmaDevice *dev);
+
+// Enable/disable IRQs
+void RceHp_IrqEnable(struct DmaDevice *dev, int en);
 
 // Clear card in top level Remove
 void RceHp_Clear(struct DmaDevice *dev);
